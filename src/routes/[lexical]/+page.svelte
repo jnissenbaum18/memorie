@@ -10,6 +10,8 @@
   import EditorOutline from '$lib/components/editor-outline.svelte';
   import EditorBacklinks from '$lib/components/editor-backlinks.svelte';
   import EditorSceneInfo from '$lib/components/editor-scene-info.svelte';
+  import AiChat from '$lib/components/ai-chat.svelte';
+  import AiChatStream from '$lib/components/ai-chat-stream.svelte';
   import TableOfContentsIcon from '@lucide/svelte/icons/table-of-contents';
   import { MOD_KEY } from '$lib/keyboard.svelte.js';
   import { appState } from '$lib/runes/app.svelte.js';
@@ -121,6 +123,8 @@
 
   /** Whether focus mode put the window into full screen (and so should undo it). */
   let enteredFullscreen = false;
+
+  let sideBarView = $state('info')
 
   async function setFocusFullscreen(/** @type {boolean} */ on) {
     try {
@@ -257,19 +261,106 @@
   >
     {#if appState.ui.isOutlineOpen && !focusMode}
       <div class="flex h-full flex-col pt-[var(--titlebar-height,0px)]">
-        <ScrollFade class="flex-1 h-full">
+
+        <div
+          class="flex shrink-0 border-b border-border/40 px-2 pt-2"
+          role="tablist"
+          aria-label="Sidebar views"
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={sideBarView === 'info'}
+            aria-controls="sidebar-info-panel"
+            id="sidebar-info-tab"
+            class="relative flex-1 px-3 py-2 text-[0.6875rem] font-mono uppercase tracking-wider transition-colors
+            {sideBarView === 'info'
+              ? 'text-foreground'
+              : 'text-metadata hover:text-foreground'}"
+            onclick={() => (sideBarView = 'info')}
+          >
+            Info
+
+            {#if sideBarView === 'info'}
+              <span
+                class="absolute inset-x-2 bottom-0 h-px bg-foreground"
+                aria-hidden="true"
+              ></span>
+            {/if}
+          </button>
+
+          <button
+            type="button"
+            role="tab"
+            aria-selected={sideBarView === 'history'}
+            aria-controls="sidebar-history-panel"
+            id="sidebar-history-tab"
+            class="relative flex-1 px-3 py-2 text-[0.6875rem] font-mono uppercase tracking-wider transition-colors
+            {sideBarView === 'history'
+              ? 'text-foreground'
+              : 'text-metadata hover:text-foreground'}"
+            onclick={() => (sideBarView = 'history')}
+          >
+            History
+
+            {#if sideBarView === 'history'}
+              <span
+                class="absolute inset-x-2 bottom-0 h-px bg-foreground"
+                aria-hidden="true"
+              ></span>
+            {/if}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={sideBarView === 'ai'}
+            aria-controls="sidebar-ai-panel"
+            id="sidebar-ai-tab"
+            class="relative flex-1 px-3 py-2 text-[0.6875rem] font-mono uppercase tracking-wider transition-colors
+            {sideBarView === 'ai'
+              ? 'text-foreground'
+              : 'text-metadata hover:text-foreground'}"
+            onclick={() => (sideBarView = 'ai')}
+          >
+            AI
+
+            {#if sideBarView === 'ai'}
+              <span
+                class="absolute inset-x-2 bottom-0 h-px bg-foreground"
+                aria-hidden="true"
+              ></span>
+            {/if}
+          </button>
+        </div>
+
+        <ScrollFade class="flex-1 min-h-0">
           <ScrollArea class="h-full" type="scroll">
-            <h2 class="px-4 py-3 text-[0.6875rem] font-mono uppercase tracking-wider text-metadata">Scene</h2>
-            {#key fileName}
-              <EditorSceneInfo {fileName} {isDraft} />
-            {/key}
-            <h2 class="px-4 pt-4 pb-3 text-[0.6875rem] font-mono uppercase tracking-wider text-metadata border-t border-border/40">Contents</h2>
-            <EditorOutline />
-            {#if !isDraft}
-              <h2 class="px-4 pt-4 pb-3 text-[0.6875rem] font-mono uppercase tracking-wider text-metadata border-t border-border/40">
-                Referenced by
-              </h2>
-              <EditorBacklinks {fileName} />
+            {#if sideBarView === 'info'}
+              <h2 class="px-4 py-3 text-[0.6875rem] font-mono uppercase tracking-wider text-metadata">Scene</h2>
+              {#key fileName}
+                <EditorSceneInfo {fileName} {isDraft} />
+              {/key}
+              <h2 class="px-4 pt-4 pb-3 text-[0.6875rem] font-mono uppercase tracking-wider text-metadata border-t border-border/40">Contents</h2>
+              <EditorOutline />
+              {#if !isDraft}
+                <h2 class="px-4 pt-4 pb-3 text-[0.6875rem] font-mono uppercase tracking-wider text-metadata border-t border-border/40">
+                  Referenced by
+                </h2>
+                <EditorBacklinks {fileName} />
+              {/if}
+            {/if}
+            {#if sideBarView === 'history'}
+              <h2 class="px-4 py-3 text-[0.6875rem] font-mono uppercase tracking-wider text-metadata">History</h2>
+              {#if history}
+                <EditorHistory {fileName} {history} />
+              {:else}
+                <div class="p-4 text-sm text-muted-foreground">No history available</div>
+              {/if}
+            {/if}
+            {#if sideBarView === 'ai'}
+              <h2 class="px-4 py-3 text-[0.6875rem] font-mono uppercase tracking-wider text-metadata">AI</h2>
+              <AiChatStream/>
+              <AiChat />
             {/if}
           </ScrollArea>
         </ScrollFade>
