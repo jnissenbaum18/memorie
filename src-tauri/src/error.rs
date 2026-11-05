@@ -22,6 +22,9 @@ pub enum FileError {
 
     #[error("\"{0}\" already exists")]
     AlreadyExists(String),
+
+    #[error("\"{0}\" is not a valid name inside your writing folder")]
+    InvalidPath(String),
 }
 
 #[derive(Error, Debug)]
@@ -58,15 +61,6 @@ pub enum LlamaError {
 pub enum MemoryError {
     #[error("SurrealDB error: {0}")]
     SurrealDB(#[from] surrealdb::Error),
-
-    #[error("Document table creation error")]
-    DocumentCreation(#[from] kalosm::language::DocumentTableCreationError),
-
-    #[error("Document table creation error")]
-    DocumentModify(#[from] kalosm::language::DocumentTableModifyError<BertError>),
-
-    #[error("Document table search error")]
-    DocumentSearchError(#[from] kalosm::language::DocumentTableSearchError<BertError>),
 
     #[error("Error getting DB path: {0}")]
     FilePathError(#[from] FileError),

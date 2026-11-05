@@ -35,19 +35,23 @@ fn relative_dir_segments(name: &str) -> Vec<String> {
 pub async fn create_file(
     name: String,
     content: String,
+    exclusive: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<File, String> {
     crate::codex::ensure_not_reserved(&name, true)?;
     let config = state.config.lock().await;
-    let path = config.content_directory.join(&name);
+    let path = fs::resolve_in(&config.content_directory, &name).map_err(|e| e.to_string())?;
+    // `create_file` doubles as autosave, so overwriting is normal; callers that
+    // mean "make a new writing" pass `exclusive` and get a clash instead.
+    if exclusive.unwrap_or(false) && path.exists() {
+        return Err(crate::error::FileError::AlreadyExists(name.clone()).to_string());
+    }
     let relative_dir = relative_dir_segments(&name);
     let result = fs::create_file(&path, &content, relative_dir).map_err(|e| e.to_string())?;
 
     let mut undo_tree = state.undotree.lock().await;
     undo_tree.add_change(&name, &content);
-    undo_tree
-        .save()
-        .map_err(|e| e.to_string())?;
+    undo_tree.save().map_err(|e| e.to_string())?;
 
     Ok(result)
 }
@@ -59,13 +63,23 @@ pub async fn update_file(
     state: State<'_, AppState>,
 ) -> Result<File, String> {
     let config = state.config.lock().await;
-    let path = config.content_directory.join(&name);
+    let path = fs::resolve_in(&config.content_directory, &name).map_err(|e| e.to_string())?;
 
-    let last_modified = std::fs::metadata(&path).and_then(|m: std::fs::Metadata| m.modified()).ok()
-        .and_then(|t: std::time::SystemTime| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-        .map(|d: std::time::Duration| d.as_secs()).unwrap_or(0);
+    let last_modified = std::fs::metadata(&path)
+        .and_then(|m: std::fs::Metadata| m.modified())
+        .ok()
+        .and_then(|t: std::time::SystemTime| {
+            t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
+        })
+        .map(|d: std::time::Duration| d.as_secs())
+        .unwrap_or(0);
     let folder = name.split_once('/').map(|(dir, _)| dir.to_string());
-    let file_to_update = File { path, name, last_modified, folder };
+    let file_to_update = File {
+        path,
+        name,
+        last_modified,
+        folder,
+    };
 
     let result = fs::update_file(&file_to_update, content).map_err(|e| e.to_string());
 
@@ -78,27 +92,94 @@ pub async fn update_file(
     result
 }
 
+/// Deletes a writing by moving it to the trash, where it can be put back.
+/// Returns the trash entry so the caller can offer an undo.
 #[tauri::command]
-pub async fn delete_file(name: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn delete_file(
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<crate::trash::TrashEntry, String> {
     let config = state.config.lock().await;
-    let path = config.content_directory.join(&name);
-
-    let last_modified = std::fs::metadata(&path).and_then(|m: std::fs::Metadata| m.modified()).ok()
-        .and_then(|t: std::time::SystemTime| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-        .map(|d: std::time::Duration| d.as_secs()).unwrap_or(0);
-    let folder = name.split_once('/').map(|(dir, _)| dir.to_string());
-    let file_to_delete = File { path, name, last_modified, folder };
-
-    fs::delete_file(&file_to_delete).map_err(|e| e.to_string())?;
+    let entry = crate::trash::send_to_trash(
+        &config.content_directory,
+        &name,
+        crate::trash::TrashKind::File,
+    )
+    .map_err(|e| e.to_string())?;
     drop(config);
 
-    // The file is already gone; a leftover index entry only affects search, so log
-    // instead of reporting the delete itself as failed.
+    // The writing is out of the way; a leftover index entry only affects
+    // search, so log instead of reporting the delete itself as failed.
     let memory = &state.memory;
-    if let Err(e) = memory.delete_document(&file_to_delete.name).await {
-        eprintln!("Failed to remove '{}' from the note index: {e}", file_to_delete.name);
+    if let Err(e) = memory.delete_document(&name).await {
+        eprintln!("Failed to remove '{name}' from the note index: {e}");
     }
-    Ok(())
+    Ok(entry)
+}
+
+/// Moves a folder and everything in it to the trash in one step, so a mistake
+/// is one undo away instead of a file-by-file rebuild.
+#[tauri::command]
+pub async fn delete_folder_to_trash(
+    relative_path: String,
+    state: State<'_, AppState>,
+) -> Result<crate::trash::TrashEntry, String> {
+    let config = state.config.lock().await;
+    let content_dir = config.content_directory.clone();
+    let inside: Vec<String> = fs::discover_files(&content_dir)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|f| f.name)
+        .filter(|n| n.starts_with(&format!("{relative_path}/")))
+        .collect();
+
+    let entry = crate::trash::send_to_trash(
+        &content_dir,
+        &relative_path,
+        crate::trash::TrashKind::Folder,
+    )
+    .map_err(|e| e.to_string())?;
+    drop(config);
+
+    let memory = &state.memory;
+    for name in inside {
+        if let Err(e) = memory.delete_document(&name).await {
+            eprintln!("Failed to remove '{name}' from the note index: {e}");
+        }
+    }
+    Ok(entry)
+}
+
+/// Everything currently in the trash, most recently deleted first.
+#[tauri::command]
+pub async fn list_trash(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::trash::TrashEntry>, String> {
+    let config = state.config.lock().await;
+    crate::trash::list(&config.content_directory).map_err(|e| e.to_string())
+}
+
+/// Puts a deleted writing or folder back, returning the path it landed at.
+#[tauri::command]
+pub async fn restore_from_trash(id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let config = state.config.lock().await;
+    crate::trash::restore(&config.content_directory, &id).map_err(|e| e.to_string())
+}
+
+/// Deletes one trashed item for good.
+#[tauri::command]
+pub async fn purge_from_trash(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let config = state.config.lock().await;
+    crate::trash::purge(&config.content_directory, &id)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Empties the trash. Returns how many items were removed.
+#[tauri::command]
+pub async fn empty_trash(state: State<'_, AppState>) -> Result<usize, String> {
+    let config = state.config.lock().await;
+    crate::trash::purge_all(&config.content_directory).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -110,18 +191,19 @@ pub async fn rename_file(
     crate::codex::ensure_not_reserved(&new_name, true)?;
     let config = state.config.lock().await;
 
-    let result =
-        fs::rename_file(&config.content_directory, &old_name, &new_name).map_err(|e| e.to_string())?;
+    let result = fs::rename_file(&config.content_directory, &old_name, &new_name)
+        .map_err(|e| e.to_string())?;
 
     let mut undo_tree = state.undotree.lock().await;
     undo_tree.rename_entry(&old_name, &new_name);
-    undo_tree
-        .save()
-        .map_err(|e| e.to_string())?;
+    undo_tree.save().map_err(|e| e.to_string())?;
 
     // Rename in memory database
     let memory = &state.memory;
-    memory.rename_document(&old_name, &new_name).await.map_err(|e| e.to_string())?;
+    memory
+        .rename_document(&old_name, &new_name)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(result)
 }
@@ -138,12 +220,22 @@ pub async fn read_file(name: String, state: State<'_, AppState>) -> Result<Strin
     drop(undo_tree);
 
     let config = state.config.lock().await;
-    let path = config.content_directory.join(&name);
-    let last_modified = std::fs::metadata(&path).and_then(|m: std::fs::Metadata| m.modified()).ok()
-        .and_then(|t: std::time::SystemTime| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-        .map(|d: std::time::Duration| d.as_secs()).unwrap_or(0);
+    let path = fs::resolve_in(&config.content_directory, &name).map_err(|e| e.to_string())?;
+    let last_modified = std::fs::metadata(&path)
+        .and_then(|m: std::fs::Metadata| m.modified())
+        .ok()
+        .and_then(|t: std::time::SystemTime| {
+            t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
+        })
+        .map(|d: std::time::Duration| d.as_secs())
+        .unwrap_or(0);
     let folder = name.split_once('/').map(|(dir, _)| dir.to_string());
-    let file = File { path, name, last_modified, folder };
+    let file = File {
+        path,
+        name,
+        last_modified,
+        folder,
+    };
     file.read_content().map_err(|e| e.to_string())
 }
 
@@ -162,8 +254,8 @@ pub async fn read_files(
 
     let files: Vec<File> = names
         .into_iter()
-        .map(|name| {
-            let path = content_dir.join(&name);
+        .filter_map(|name| {
+            let path = fs::resolve_in(&content_dir, &name).ok()?;
             let last_modified = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .ok()
@@ -171,7 +263,12 @@ pub async fn read_files(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let folder = name.split_once('/').map(|(dir, _)| dir.to_string());
-            File { path, name, last_modified, folder }
+            Some(File {
+                path,
+                name,
+                last_modified,
+                folder,
+            })
         })
         .collect();
 
@@ -203,15 +300,14 @@ pub async fn rename_binder(
 ) -> Result<(), String> {
     crate::codex::ensure_not_reserved(&new_name, false)?;
     let config = state.config.lock().await;
-    fs::rename_binder(&config.content_directory, &old_name, &new_name).map_err(|e| e.to_string())?;
+    fs::rename_binder(&config.content_directory, &old_name, &new_name)
+        .map_err(|e| e.to_string())?;
 
     // Every writing inside moved with the folder: keep their history and
     // embeddings keyed to the new paths.
     let mut undo_tree = state.undotree.lock().await;
     undo_tree.rename_prefix(&old_name, &new_name);
-    undo_tree
-        .save()
-        .map_err(|e| e.to_string())?;
+    undo_tree.save().map_err(|e| e.to_string())?;
 
     let memory = &state.memory;
     memory
@@ -232,17 +328,18 @@ pub async fn move_file(
 ) -> Result<File, String> {
     crate::codex::ensure_not_reserved(&new_name, true)?;
     let config = state.config.lock().await;
-    let result =
-        fs::move_file(&config.content_directory, &old_name, &new_name).map_err(|e| e.to_string())?;
+    let result = fs::move_file(&config.content_directory, &old_name, &new_name)
+        .map_err(|e| e.to_string())?;
 
     let mut undo_tree = state.undotree.lock().await;
     undo_tree.rename_entry(&old_name, &new_name);
-    undo_tree
-        .save()
-        .map_err(|e| e.to_string())?;
+    undo_tree.save().map_err(|e| e.to_string())?;
 
     let memory = &state.memory;
-    memory.rename_document(&old_name, &new_name).await.map_err(|e| e.to_string())?;
+    memory
+        .rename_document(&old_name, &new_name)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(result)
 }
@@ -256,7 +353,10 @@ pub async fn delete_binder(name: String, state: State<'_, AppState>) -> Result<(
 /// Creates an empty nested folder (e.g. a chapter inside a Novel binder) at
 /// `relative_path`, relative to the content directory.
 #[tauri::command]
-pub async fn create_folder(relative_path: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn create_folder(
+    relative_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     crate::codex::ensure_not_reserved(&relative_path, false)?;
     let config = state.config.lock().await;
     fs::create_folder(&config.content_directory, &relative_path).map_err(|e| e.to_string())
@@ -273,7 +373,10 @@ pub async fn list_folders(state: State<'_, AppState>) -> Result<Vec<String>, Str
 /// Deletes an empty nested folder (chapter, scene grouping, ...). Refuses if
 /// it still contains anything, same rule as `delete_binder`.
 #[tauri::command]
-pub async fn delete_folder(relative_path: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn delete_folder(
+    relative_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let config = state.config.lock().await;
     fs::delete_folder(&config.content_directory, &relative_path).map_err(|e| e.to_string())
 }
@@ -294,7 +397,9 @@ pub async fn check_models(state: State<'_, AppState>) -> Result<Vec<ModelStatus>
 }
 
 #[tauri::command]
-pub async fn get_supported_models(state: State<'_, AppState>) -> Result<Vec<SupportedModel>, String> {
+pub async fn get_supported_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<SupportedModel>, String> {
     let model = state.model.lock().await;
     Ok(model.get_supported_models().await)
 }
@@ -317,7 +422,10 @@ pub async fn download_model(
 }
 
 #[tauri::command]
-pub async fn load_models(handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+pub async fn load_models(
+    handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     let model_id = {
         let config = state.config.lock().await;
         if !config.ai_enabled {
@@ -464,13 +572,13 @@ pub async fn create_document_context(
         .await
         .map_err(|e| e.to_string())?;
     match document_context {
-        Some(document) => {
-            let result = memory.get_dirty_document_chunk(document.id.unwrap()).await;
-            Ok(Response::success(result))
-        }
-        None => {
-            Ok(Response::success(Vec::new()))
-        }
+        Some(document) => match document.get_thing_id() {
+            Some(id) => Ok(Response::success(memory.get_dirty_document_chunk(id).await)),
+            // Stored without an id: nothing to attach chunks to, and the
+            // editor only needs an empty list to carry on.
+            None => Ok(Response::success(Vec::new())),
+        },
+        None => Ok(Response::success(Vec::new())),
     }
 }
 
@@ -490,15 +598,13 @@ pub async fn get_document_context(
                         let result = memory.get_dirty_document_chunk(id).await;
                         Ok(Response::success(result))
                     }
-                    None => {
-                        Ok(Response::success(Vec::new()))
-                    }
+                    None => Ok(Response::success(Vec::new())),
                 }
             } else {
                 Ok(Response::success(Vec::new()))
             }
         }
-        Err(_) => todo!(),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -508,7 +614,7 @@ pub async fn get_document_context(
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<super::config::AppConfig, String> {
     let config = state.config.lock().await;
-    Ok(serde_json::from_str(&serde_json::to_string(&*config).unwrap()).unwrap())
+    Ok(config.clone())
 }
 
 #[tauri::command]
@@ -529,10 +635,7 @@ pub async fn set_default_llm_model(
 }
 
 #[tauri::command]
-pub async fn set_system_prompt(
-    prompt: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn set_system_prompt(prompt: String, state: State<'_, AppState>) -> Result<(), String> {
     let config_path = super::utils::get_app_dir()
         .map_err(|e| e.to_string())?
         .join("config.yaml");
@@ -540,7 +643,11 @@ pub async fn set_system_prompt(
         .to_str()
         .ok_or_else(|| "Config path not UTF-8".to_string())?;
     let mut config = state.config.lock().await;
-    config.system_prompt = if prompt.trim().is_empty() { None } else { Some(prompt) };
+    config.system_prompt = if prompt.trim().is_empty() {
+        None
+    } else {
+        Some(prompt)
+    };
     config.save(config_path_str).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -560,9 +667,7 @@ pub async fn goto_file_version(
     let result = undo_tree.goto_version(&name, node_id);
 
     if result.is_some() {
-        undo_tree
-            .save()
-            .map_err(|e| e.to_string())?;
+        undo_tree.save().map_err(|e| e.to_string())?;
     }
 
     Ok(result)
@@ -575,9 +680,7 @@ pub async fn undo_file(name: String, state: State<'_, AppState>) -> Result<Optio
     let result = undo_tree.undo(&name);
 
     if result.is_some() {
-        undo_tree
-            .save()
-            .map_err(|e| e.to_string())?;
+        undo_tree.save().map_err(|e| e.to_string())?;
     }
 
     Ok(result)
@@ -590,9 +693,7 @@ pub async fn redo_file(name: String, state: State<'_, AppState>) -> Result<Optio
     let result = undo_tree.redo_latest_branch(&name);
 
     if result.is_some() {
-        undo_tree
-            .save()
-            .map_err(|e| e.to_string())?;
+        undo_tree.save().map_err(|e| e.to_string())?;
     }
 
     Ok(result)
@@ -603,12 +704,18 @@ pub async fn redo_file(name: String, state: State<'_, AppState>) -> Result<Optio
  */
 #[tauri::command]
 pub async fn github_device_start() -> Result<super::git::DeviceCode, String> {
-    super::git::start_device_flow().await.map_err(|e| e.to_string())
+    super::git::start_device_flow()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn github_device_poll(device_code: String) -> Result<super::git::DevicePollResult, String> {
-    super::git::poll_device_flow(&device_code).await.map_err(|e| e.to_string())
+pub async fn github_device_poll(
+    device_code: String,
+) -> Result<super::git::DevicePollResult, String> {
+    super::git::poll_device_flow(&device_code)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -621,7 +728,9 @@ pub async fn github_get_user() -> Result<Option<super::git::GitHubUser>, String>
     let token = super::git::load_token().map_err(|e| e.to_string())?;
     match token {
         Some(token) => {
-            let user = super::git::fetch_github_user(&token).await.map_err(|e| e.to_string())?;
+            let user = super::git::fetch_github_user(&token)
+                .await
+                .map_err(|e| e.to_string())?;
             Ok(Some(user))
         }
         None => Ok(None),
@@ -629,7 +738,9 @@ pub async fn github_get_user() -> Result<Option<super::git::GitHubUser>, String>
 }
 
 #[tauri::command]
-pub async fn git_status(state: State<'_, AppState>) -> Result<Vec<super::git::GitFileStatus>, String> {
+pub async fn git_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<super::git::GitFileStatus>, String> {
     let config = state.config.lock().await;
     super::git::status(&config.content_directory).map_err(|e| e.to_string())
 }
@@ -651,7 +762,10 @@ pub async fn git_set_repo(owner_repo: String, state: State<'_, AppState>) -> Res
 }
 
 #[tauri::command]
-pub async fn set_auto_push_on_exit(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn set_auto_push_on_exit(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let config_path = super::utils::get_app_dir()
         .map_err(|e| e.to_string())?
         .join("config.yaml");
@@ -742,7 +856,9 @@ pub async fn get_openrouter_models() -> Result<Vec<OpenRouterModel>, String> {
     let api_key = providers::load_api_key()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No OpenRouter API key set. Add one in Settings.".to_string())?;
-    providers::fetch_models(&api_key).await.map_err(|e| e.to_string())
+    providers::fetch_models(&api_key)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -761,7 +877,10 @@ pub async fn git_pull(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn git_commit_and_push(message: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn git_commit_and_push(
+    message: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let config = state.config.lock().await;
 
     if config.github_repo.is_none() {
@@ -772,7 +891,9 @@ pub async fn git_commit_and_push(message: String, state: State<'_, AppState>) ->
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Not logged in to GitHub".to_string())?;
 
-    let user = super::git::fetch_github_user(&token).await.map_err(|e| e.to_string())?;
+    let user = super::git::fetch_github_user(&token)
+        .await
+        .map_err(|e| e.to_string())?;
     let author_name = user.name.unwrap_or_else(|| user.login.clone());
     let author_email = format!("{}@users.noreply.github.com", user.login);
 
@@ -821,7 +942,9 @@ pub async fn dropbox_start_login() -> Result<super::dropbox::DropboxAuthStart, S
 
 #[tauri::command]
 pub async fn dropbox_poll_login() -> Result<super::dropbox::AuthPollResult, String> {
-    super::dropbox::poll_login().await.map_err(|e| e.to_string())
+    super::dropbox::poll_login()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -837,7 +960,9 @@ pub async fn dropbox_logout() -> Result<(), String> {
 
 #[tauri::command]
 pub async fn dropbox_get_account() -> Result<Option<super::dropbox::DropboxAccount>, String> {
-    super::dropbox::current_account().await.map_err(|e| e.to_string())
+    super::dropbox::current_account()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -897,7 +1022,9 @@ pub async fn dropbox_status(
 }
 
 #[tauri::command]
-pub async fn dropbox_push(state: State<'_, AppState>) -> Result<super::dropbox::SyncResult, String> {
+pub async fn dropbox_push(
+    state: State<'_, AppState>,
+) -> Result<super::dropbox::SyncResult, String> {
     let (content_dir, folder) = dropbox_target(&state).await?;
     super::dropbox::push(&content_dir, &folder)
         .await
@@ -905,7 +1032,9 @@ pub async fn dropbox_push(state: State<'_, AppState>) -> Result<super::dropbox::
 }
 
 #[tauri::command]
-pub async fn dropbox_pull(state: State<'_, AppState>) -> Result<super::dropbox::SyncResult, String> {
+pub async fn dropbox_pull(
+    state: State<'_, AppState>,
+) -> Result<super::dropbox::SyncResult, String> {
     let (content_dir, folder) = dropbox_target(&state).await?;
     super::dropbox::pull(&content_dir, &folder)
         .await
@@ -935,7 +1064,10 @@ pub async fn export_manuscript(
 
 /// A binder's saved export settings (JSON), or null if it has none.
 #[tauri::command]
-pub async fn read_compile_settings(binder: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
+pub async fn read_compile_settings(
+    binder: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
     let content_dir = state.config.lock().await.content_directory.clone();
     crate::export::read_compile_settings(&content_dir, &binder)
 }
@@ -1010,7 +1142,8 @@ pub async fn replace_in_project(
                 continue;
             }
         };
-        let (updated, count) = crate::search::replace_content(&regex, &original, &replacement, &options);
+        let (updated, count) =
+            crate::search::replace_content(&regex, &original, &replacement, &options);
         if count == 0 || updated == original {
             continue;
         }
@@ -1041,7 +1174,8 @@ pub async fn import_sources(
     state: State<'_, AppState>,
 ) -> Result<crate::import::ImportReport, String> {
     let content_dir = state.config.lock().await.content_directory.clone();
-    let sources: Vec<std::path::PathBuf> = sources.into_iter().map(std::path::PathBuf::from).collect();
+    let sources: Vec<std::path::PathBuf> =
+        sources.into_iter().map(std::path::PathBuf::from).collect();
     tokio::task::spawn_blocking(move || {
         crate::import::import_sources(&sources, &target_dir, split_docx, &content_dir)
     })
@@ -1061,9 +1195,11 @@ pub async fn codex_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::codex::Entity>, String> {
     let content_dir = state.config.lock().await.content_directory.clone();
-    tokio::task::spawn_blocking(move || crate::codex::list_entities(&content_dir, binder.as_deref()))
-        .await
-        .map_err(|e| e.to_string())?
+    tokio::task::spawn_blocking(move || {
+        crate::codex::list_entities(&content_dir, binder.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Creates an entry, or updates the one read from `original_path` (moving its
@@ -1156,7 +1292,11 @@ pub async fn codex_draft(
 ) -> Result<crate::codex::SheetDraft, String> {
     let (content_dir, ai_enabled, provider) = {
         let config = state.config.lock().await;
-        (config.content_directory.clone(), config.ai_enabled, config.provider.clone())
+        (
+            config.content_directory.clone(),
+            config.ai_enabled,
+            config.provider.clone(),
+        )
     };
     if !ai_enabled {
         return Err("AI is disabled. Enable it in Settings first.".to_string());
@@ -1207,13 +1347,19 @@ pub async fn codex_draft(
     };
     let passages = crate::codex::gather_passages(&entity, &writings, budget);
     if passages.is_empty() {
-        return Err(format!("No writing mentions “{}” yet, so there's nothing to draw on.", entity.name));
+        return Err(format!(
+            "No writing mentions “{}” yet, so there's nothing to draw on.",
+            entity.name
+        ));
     }
 
     let want_summary = entity.summary.is_empty();
     let message = crate::codex::draft_message(&entity, &keys, &passages);
-    let reply = crate::workers::complete_once(&handle, crate::prompts::CODEX_DRAFT_PROMPT, &message).await?;
-    let draft: crate::codex::SheetDraft = providers::parse_json_reply(&reply)
-        .map_err(|_| "The model's answer couldn't be read. Try again, or use a larger model.".to_string())?;
+    let reply =
+        crate::workers::complete_once(&handle, crate::prompts::CODEX_DRAFT_PROMPT, &message)
+            .await?;
+    let draft: crate::codex::SheetDraft = providers::parse_json_reply(&reply).map_err(|_| {
+        "The model's answer couldn't be read. Try again, or use a larger model.".to_string()
+    })?;
     Ok(draft.keep_only(&keys, want_summary))
 }

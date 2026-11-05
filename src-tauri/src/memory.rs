@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use surrealdb::engine::local::{Db, SurrealKv};
-use surrealdb::sql::Thing;
+use surrealdb::types::{RecordId, SurrealValue};
 use surrealdb::Surreal;
 
 // -------------------------------------------------------
@@ -19,9 +19,10 @@ use surrealdb::Surreal;
 const DOCUMENT_TABLE: &str = "documents";
 const CHUNK_TABLE: &str = "chunk";
 
-/// Bumped whenever what gets embedded for a chunk changes. It is mixed into the chunk
-/// hash, so existing chunks stop matching and are re-embedded on the next index pass.
-pub const EMBED_VERSION: &str = "v3-sections";
+/// Bumped whenever what gets embedded for a chunk changes, or the database is replaced.
+/// It is mixed into the chunk hash, so existing chunks stop matching and are re-embedded
+/// on the next index pass, and the indexer re-reads every note when it changes.
+pub const EMBED_VERSION: &str = "v4-surrealdb3";
 
 /// Chunks embedded per forward pass while indexing.
 const EMBED_BATCH: usize = 32;
@@ -37,7 +38,11 @@ const RELATIVE_SIMILARITY_WINDOW: f32 = 0.12;
 fn chunk_hash(chunk: &Chunk) -> String {
     let mut hasher = Sha256::new();
     hasher.update(EMBED_VERSION);
-    for part in [chunk.headings.join(SECTION_SEP), chunk.overlap.clone(), chunk.text.clone()] {
+    for part in [
+        chunk.headings.join(SECTION_SEP),
+        chunk.overlap.clone(),
+        chunk.text.clone(),
+    ] {
         hasher.update(":");
         hasher.update(part.len().to_le_bytes());
         hasher.update(part);
@@ -105,9 +110,19 @@ impl Memory {
     /// The embedding model is not loaded here; see `embedder`.
     pub async fn new() -> Result<Self, MemoryError> {
         // TODO! Make the path configurable via app settings
-        let root_dir = utils::get_app_dir()?.join("db/memory/");
+        let app_dir = utils::get_app_dir()?;
+        // SurrealDB 3 can't open what 2.x wrote. The index is rebuilt from the notes,
+        // so the old one is dropped rather than migrated.
+        let legacy_dir = app_dir.join("db/memory/");
+        if legacy_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&legacy_dir) {
+                eprintln!("Could not remove the old search index: {e}");
+            }
+        }
+        let root_dir = app_dir.join("db/memory-v3/");
         let db = Surreal::new::<SurrealKv>(root_dir.clone()).await?;
         db.use_ns("embeddings_ns").use_db("embeddings").await?;
+        ensure_tables(&db).await?;
 
         let memory = Memory {
             db,
@@ -143,7 +158,8 @@ impl Memory {
                                 source,
                                 progress: file_loading_progress,
                             } => {
-                                let elapsed = file_loading_progress.start_time.elapsed().as_secs_f32();
+                                let elapsed =
+                                    file_loading_progress.start_time.elapsed().as_secs_f32();
                                 let progress = (progress.progress() * 100.0) as u32;
                                 println!("Downloading file {source} {progress}% ({elapsed}s)");
                             }
@@ -218,7 +234,8 @@ impl Memory {
     /// it doesn't set one, so it is added here. Passages are embedded with
     /// `generate_embedding`, so changing this never requires re-indexing.
     pub async fn generate_query_embedding(&self, query: &str) -> Result<Vec<f32>, MemoryError> {
-        self.generate_embedding(&format!("{BGE_QUERY_PREFIX}{query}")).await
+        self.generate_embedding(&format!("{BGE_QUERY_PREFIX}{query}"))
+            .await
     }
 
     /// The reranker, loading (and on first run downloading) it if needed. The
@@ -242,7 +259,12 @@ impl Memory {
     /// Reorders `results` by the cross-encoder's judgement of how well each answers
     /// `query` and keeps the best `limit`. Without a reranker, or if it fails, the
     /// incoming order is kept.
-    async fn rerank(&self, query: &str, mut results: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
+    async fn rerank(
+        &self,
+        query: &str,
+        mut results: Vec<SearchResult>,
+        limit: usize,
+    ) -> Vec<SearchResult> {
         if results.len() > 1 {
             if let Some(reranker) = self.reranker().await {
                 // The reranker sees where a passage sits, as the embedding did.
@@ -260,16 +282,23 @@ impl Memory {
                 let query = query.to_string();
                 let started = std::time::Instant::now();
                 let _gpu = crate::gpu::lock().await;
-                let scored = tokio::task::spawn_blocking(move || reranker.score(&query, &passages)).await;
+                let scored =
+                    tokio::task::spawn_blocking(move || reranker.score(&query, &passages)).await;
                 match scored {
                     Ok(Ok(scores)) if scores.len() == results.len() => {
                         for (result, score) in results.iter_mut().zip(scores) {
                             result.rerank_score = Some(score);
                         }
                         results.sort_by(|a, b| {
-                            b.rerank_score.unwrap_or(f32::MIN).total_cmp(&a.rerank_score.unwrap_or(f32::MIN))
+                            b.rerank_score
+                                .unwrap_or(f32::MIN)
+                                .total_cmp(&a.rerank_score.unwrap_or(f32::MIN))
                         });
-                        println!(">> Reranked {} passages in {:?}", results.len(), started.elapsed());
+                        println!(
+                            ">> Reranked {} passages in {:?}",
+                            results.len(),
+                            started.elapsed()
+                        );
                     }
                     Ok(Ok(_)) => eprintln!("Reranker returned the wrong number of scores"),
                     Ok(Err(e)) => eprintln!("Reranking failed, keeping search order: {e}"),
@@ -291,7 +320,10 @@ impl Memory {
     /// Embeds `texts` in batches, returning vectors in the same order. Much faster
     /// than one `generate_embedding` per text, since each batch is one forward
     /// pass. The GPU is released between batches so a chat can get in.
-    pub async fn generate_embeddings(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, MemoryError> {
+    pub async fn generate_embeddings(
+        &self,
+        texts: Vec<String>,
+    ) -> Result<Vec<Vec<f32>>, MemoryError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -315,7 +347,7 @@ impl Memory {
             "DEFINE ANALYZER IF NOT EXISTS note_text TOKENIZERS blank, class \
                  FILTERS lowercase, ascii, snowball(english); \
              DEFINE INDEX IF NOT EXISTS chunk_content_fts ON chunk FIELDS content \
-                 SEARCH ANALYZER note_text BM25;",
+                 FULLTEXT ANALYZER note_text BM25;",
         );
         if let Some(dimension) = dimension {
             // The dimension is part of the name, so a model with a different output
@@ -345,7 +377,7 @@ impl Memory {
         &self,
         query_embedding: &[f32],
         k: usize,
-        within: Option<&[Thing]>,
+        within: Option<&[RecordId]>,
     ) -> Result<Vec<ScoredChunk>, MemoryError> {
         let k = k.max(1);
         if let Some(ids) = within {
@@ -371,8 +403,11 @@ impl Memory {
         );
         if self.vector_index.load(Ordering::SeqCst) {
             let indexed = async {
-                let mut response =
-                    self.db.query(knn).bind(("query_vec", query_embedding.to_vec())).await?;
+                let mut response = self
+                    .db
+                    .query(knn)
+                    .bind(("query_vec", query_embedding.to_vec()))
+                    .await?;
                 response.take::<Vec<ScoredChunk>>(0)
             }
             .await;
@@ -404,7 +439,7 @@ impl Memory {
         query: &str,
         query_embedding: &[f32],
         k: usize,
-        within: Option<&[Thing]>,
+        within: Option<&[RecordId]>,
     ) -> Result<Vec<ScoredChunk>, MemoryError> {
         let terms = keyword_terms(query);
         if terms.is_empty() {
@@ -413,8 +448,13 @@ impl Memory {
         // `@@` needs every term to match, so each term gets its own clause and
         // reference; `search::score(n)` is 0 for a term that didn't match.
         let refs = 1..=terms.len();
-        let matches = refs.clone().map(|n| format!("content @{n}@ $t{n}")).collect::<Vec<_>>();
-        let scores = refs.map(|n| format!("search::score({n})")).collect::<Vec<_>>();
+        let matches = refs
+            .clone()
+            .map(|n| format!("content @{n}@ $t{n}"))
+            .collect::<Vec<_>>();
+        let scores = refs
+            .map(|n| format!("search::score({n})"))
+            .collect::<Vec<_>>();
         let sql = format!(
             "SELECT {CHUNK_FIELDS}, {bm25} AS bm25, \
                  IF embedding IS NOT NONE AND array::len(embedding) > 0 \
@@ -422,7 +462,11 @@ impl Memory {
              FROM chunk WHERE ({matches}){scope} ORDER BY bm25 DESC LIMIT $limit",
             bm25 = scores.join(" + "),
             matches = matches.join(" OR "),
-            scope = if within.is_some() { " AND parent IN $ids" } else { "" },
+            scope = if within.is_some() {
+                " AND parent IN $ids"
+            } else {
+                ""
+            },
         );
         let mut request = self
             .db
@@ -478,7 +522,10 @@ impl Memory {
 
         let pool = (limit * 3).max(24);
         let vector = strong_matches(self.nearest_chunks(&query_embedding, pool, within).await?);
-        let keyword = match self.keyword_chunks(query, &query_embedding, pool, within).await {
+        let keyword = match self
+            .keyword_chunks(query, &query_embedding, pool, within)
+            .await
+        {
             Ok(chunks) => strong_keyword_matches(chunks),
             Err(e) => {
                 eprintln!("Keyword search failed, using vector results only: {e}");
@@ -492,7 +539,7 @@ impl Memory {
     }
 
     /// Ids of the notes inside `binder` (a top-level folder), at any depth.
-    async fn binder_documents(&self, binder: &str) -> Result<Vec<Thing>, MemoryError> {
+    async fn binder_documents(&self, binder: &str) -> Result<Vec<RecordId>, MemoryError> {
         let mut response = self
             .db
             .query("SELECT VALUE id FROM documents WHERE string::starts_with(title, $prefix)")
@@ -502,13 +549,16 @@ impl Memory {
     }
 
     /// Attaches each chunk's note title, dropping chunks whose note is gone.
-    async fn with_titles(&self, chunks: Vec<ScoredChunk>) -> Result<Vec<SearchResult>, MemoryError> {
+    async fn with_titles(
+        &self,
+        chunks: Vec<ScoredChunk>,
+    ) -> Result<Vec<SearchResult>, MemoryError> {
         let db = &self.db;
-        let mut parent_ids: Vec<Thing> = chunks.iter().map(|c| c.parent.clone()).collect();
+        let mut parent_ids: Vec<RecordId> = chunks.iter().map(|c| c.parent.clone()).collect();
         parent_ids.sort();
         parent_ids.dedup();
 
-        let mut doc_map: HashMap<Thing, String> = HashMap::new();
+        let mut doc_map: HashMap<RecordId, String> = HashMap::new();
         if !parent_ids.is_empty() {
             let sql_docs = "SELECT * FROM $ids";
             let mut doc_response = db.query(sql_docs).bind(("ids", parent_ids)).await?;
@@ -544,6 +594,18 @@ impl Memory {
     }
 }
 
+/// Creates the tables if they are missing. Selecting from a table that doesn't
+/// exist is an error, so a fresh database needs them before the first lookup.
+async fn ensure_tables(db: &Surreal<Db>) -> Result<(), MemoryError> {
+    db.query(format!(
+        "DEFINE TABLE IF NOT EXISTS {DOCUMENT_TABLE} SCHEMALESS; \
+         DEFINE TABLE IF NOT EXISTS {CHUNK_TABLE} SCHEMALESS;"
+    ))
+    .await?
+    .check()?;
+    Ok(())
+}
+
 /// Query instruction for bge-small-en-v1.5; see `generate_query_embedding`.
 const BGE_QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 
@@ -566,11 +628,11 @@ const MIN_RELATIVE_BM25: f32 = 0.3;
 
 /// Words too common to say anything about which passage is meant.
 const STOPWORDS: &[&str] = &[
-    "a", "about", "an", "and", "are", "as", "at", "be", "but", "by", "did", "do", "does",
-    "for", "from", "had", "has", "have", "he", "her", "his", "how", "i", "in", "is", "it",
-    "its", "me", "my", "notes", "of", "on", "or", "our", "she", "so", "that", "the", "their",
-    "them", "they", "this", "to", "was", "we", "were", "what", "when", "where", "which",
-    "who", "why", "will", "with", "you", "your",
+    "a", "about", "an", "and", "are", "as", "at", "be", "but", "by", "did", "do", "does", "for",
+    "from", "had", "has", "have", "he", "her", "his", "how", "i", "in", "is", "it", "its", "me",
+    "my", "notes", "of", "on", "or", "our", "she", "so", "that", "the", "their", "them", "they",
+    "this", "to", "was", "we", "were", "what", "when", "where", "which", "who", "why", "will",
+    "with", "you", "your",
 ];
 
 /// Distinct lowercase words of `query` worth matching on, in order.
@@ -607,7 +669,7 @@ fn strong_keyword_matches(chunks: Vec<ScoredChunk>) -> Vec<ScoredChunk> {
 /// chunk's `found_by` records which lists it came from (bit `1 << n` for list `n`).
 fn fuse_ranked<const N: usize>(lists: [Vec<ScoredChunk>; N], limit: usize) -> Vec<ScoredChunk> {
     let mut fused: Vec<(f32, ScoredChunk)> = Vec::new();
-    let mut position: HashMap<Thing, usize> = HashMap::new();
+    let mut position: HashMap<RecordId, usize> = HashMap::new();
     for (n, list) in lists.into_iter().enumerate() {
         let bit = 1u8 << n;
         for (rank, mut chunk) in list.into_iter().enumerate() {
@@ -626,7 +688,11 @@ fn fuse_ranked<const N: usize>(lists: [Vec<ScoredChunk>; N], limit: usize) -> Ve
         }
     }
     fused.sort_by(|a, b| b.0.total_cmp(&a.0));
-    fused.into_iter().take(limit).map(|(_, chunk)| chunk).collect()
+    fused
+        .into_iter()
+        .take(limit)
+        .map(|(_, chunk)| chunk)
+        .collect()
 }
 
 // -------------------------------------------------------
@@ -635,9 +701,9 @@ fn fuse_ranked<const N: usize>(lists: [Vec<ScoredChunk>; N], limit: usize) -> Ve
 
 /// Represents a note document with a title and body content.
 /// This struct is used for storing and managing documents in the RAG memory system.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, SurrealValue)]
 pub struct NoteDocument {
-    pub id: Option<Thing>,
+    pub id: Option<RecordId>,
     pub title: String,
     pub body: String,
 }
@@ -661,17 +727,17 @@ impl NoteDocument {
         self.title = title.to_string();
     }
 
-    pub fn get_thing_id(&self) -> Option<Thing> {
+    pub fn get_thing_id(&self) -> Option<RecordId> {
         self.id.clone()
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, SurrealValue)]
 pub struct TextChunk {
     /// Left out when unset, so new chunks get an id from the database.
     #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<Thing>,
-    pub parent: Thing,
+    id: Option<RecordId>,
+    pub parent: RecordId,
     pub content: String,
     pub sequence: usize,
     content_hash: String,
@@ -681,29 +747,33 @@ pub struct TextChunk {
     pub embedding: Option<Vec<f32>>,
 
     #[serde(default)]
+    #[surreal(default)]
     pub created_at: i64,
 
     /// Headings above the passage joined with " › ", empty when it has none.
     #[serde(default)]
+    #[surreal(default)]
     pub section: String,
     /// Lines of the note the passage covers, 1-based.
     #[serde(default)]
+    #[surreal(default)]
     pub start_line: usize,
     #[serde(default)]
+    #[surreal(default)]
     pub end_line: usize,
 }
 
 impl TextChunk {
     #[cfg(test)]
-    pub fn get_thing_id(&self) -> Option<Thing> {
+    pub fn get_thing_id(&self) -> Option<RecordId> {
         self.id.clone()
     }
 }
 
 /// A kept chunk's new place in its note, after edits above it moved it.
-#[derive(Serialize)]
+#[derive(SurrealValue)]
 struct MovedChunk {
-    id: Thing,
+    id: RecordId,
     content: String,
     sequence: usize,
     section: String,
@@ -715,7 +785,7 @@ struct MovedChunk {
 /// its cosine similarity to the query. Results are ordered best match first.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
-    pub parent: Thing,
+    pub parent: RecordId,
     pub content: String,
     pub sequence: usize,
     pub title: String,
@@ -733,24 +803,20 @@ pub struct SearchResult {
 pub const FOUND_BY_MEANING: u8 = 1;
 pub const FOUND_BY_KEYWORDS: u8 = 2;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct ScoredChunk {
-    id: Thing,
-    parent: Thing,
+    id: RecordId,
+    parent: RecordId,
     content: String,
     sequence: usize,
     score: f32,
-    #[serde(default)]
     section: Option<String>,
-    #[serde(default)]
     start_line: Option<usize>,
-    #[serde(default)]
     end_line: Option<usize>,
     /// Keyword search only: summed BM25 over the matched terms.
-    #[serde(default)]
     bm25: Option<f32>,
     /// Set by `fuse_ranked`: bit `1 << n` for each input list it appeared in.
-    #[serde(skip)]
+    #[surreal(default)]
     found_by: u8,
 }
 
@@ -760,7 +826,7 @@ pub struct IndexStats {
     pub passages: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct CountRow {
     n: usize,
 }
@@ -779,7 +845,7 @@ pub trait MemoryDocumentAnalysisExt {
         limit: usize,
         binder: Option<&str>,
     ) -> Result<Vec<SearchResult>, MemoryError>;
-    async fn get_dirty_document_chunk(&self, document_id: Thing) -> Vec<TextChunk>;
+    async fn get_dirty_document_chunk(&self, document_id: RecordId) -> Vec<TextChunk>;
     async fn to_document_context(
         &self,
         embedding_document: NoteDocument,
@@ -813,7 +879,8 @@ impl MemoryDocumentAnalysisExt for Memory {
         binder: Option<&str>,
     ) -> Result<Vec<SearchResult>, MemoryError> {
         let query_embedding = self.generate_query_embedding(query).await?;
-        self.search_hybrid(query, query_embedding, limit, binder).await
+        self.search_hybrid(query, query_embedding, limit, binder)
+            .await
     }
 
     async fn update_dirty_chunk(&self, chunk: TextChunk, new_content: &str) -> Vec<TextChunk> {
@@ -825,7 +892,7 @@ impl MemoryDocumentAnalysisExt for Memory {
         updated
     }
 
-    async fn get_dirty_document_chunk(&self, document_id: Thing) -> Vec<TextChunk> {
+    async fn get_dirty_document_chunk(&self, document_id: RecordId) -> Vec<TextChunk> {
         let db = &self.db;
         let sql =
             "SELECT * FROM chunk WHERE parent = $id AND is_dirty = true ORDER BY sequence ASC";
@@ -906,7 +973,10 @@ impl MemoryDocumentAnalysisExt for Memory {
         let embeddings = match self.generate_embeddings(inputs).await {
             Ok(vectors) => vectors,
             Err(e) => {
-                eprintln!("Failed to generate embeddings for '{}': {e}", embedding_document.title);
+                eprintln!(
+                    "Failed to generate embeddings for '{}': {e}",
+                    embedding_document.title
+                );
                 Vec::new()
             }
         };
@@ -929,7 +999,7 @@ impl MemoryDocumentAnalysisExt for Memory {
                 end_line: segment.end_line,
             })
             .collect();
-        let removed: Vec<Thing> = old_chunk_map.into_values().filter_map(|c| c.id).collect();
+        let removed: Vec<RecordId> = old_chunk_map.into_values().filter_map(|c| c.id).collect();
 
         println!(
             ">> Indexed '{}': {} new, {} moved, {} removed, {} unchanged",
@@ -1041,6 +1111,7 @@ mod memory_tests {
     async fn test_memory() -> Memory {
         let db = Surreal::new::<Mem>(()).await.unwrap();
         db.use_ns("test").use_db("test").await.unwrap();
+        ensure_tables(&db).await.unwrap();
         Memory {
             db,
             embedding_model: tokio::sync::OnceCell::new(),
@@ -1050,7 +1121,7 @@ mod memory_tests {
         }
     }
 
-    async fn insert_document(memory: &Memory, title: &str) -> Thing {
+    async fn insert_document(memory: &Memory, title: &str) -> RecordId {
         memory
             .create_or_update_document(title, "body")
             .await
@@ -1060,7 +1131,12 @@ mod memory_tests {
             .unwrap()
     }
 
-    async fn insert_chunk(memory: &Memory, parent: &Thing, content: &str, embedding: Option<Vec<f32>>) {
+    async fn insert_chunk(
+        memory: &Memory,
+        parent: &RecordId,
+        content: &str,
+        embedding: Option<Vec<f32>>,
+    ) {
         let _: Option<TextChunk> = memory
             .db
             .create(CHUNK_TABLE)
@@ -1087,13 +1163,28 @@ mod memory_tests {
         let memory = test_memory().await;
         let dragons = insert_document(&memory, "Lore/Dragons.md").await;
         let recipes = insert_document(&memory, "Recipes.md").await;
-        insert_chunk(&memory, &dragons, "dragon backstory", Some(vec![1.0, 0.0, 0.0])).await;
-        insert_chunk(&memory, &dragons, "dragon diet", Some(vec![0.95, 0.31, 0.0])).await;
+        insert_chunk(
+            &memory,
+            &dragons,
+            "dragon backstory",
+            Some(vec![1.0, 0.0, 0.0]),
+        )
+        .await;
+        insert_chunk(
+            &memory,
+            &dragons,
+            "dragon diet",
+            Some(vec![0.95, 0.31, 0.0]),
+        )
+        .await;
         insert_chunk(&memory, &recipes, "soup", Some(vec![0.0, 1.0, 0.0])).await;
         insert_chunk(&memory, &recipes, "failed embedding", None).await;
         insert_chunk(&memory, &recipes, "legacy empty embedding", Some(vec![])).await;
 
-        let results = memory.search_by_embedding(vec![1.0, 0.0, 0.0], 8).await.unwrap();
+        let results = memory
+            .search_by_embedding(vec![1.0, 0.0, 0.0], 8)
+            .await
+            .unwrap();
 
         let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
         assert_eq!(contents, vec!["dragon backstory", "dragon diet"]);
@@ -1117,7 +1208,7 @@ mod memory_tests {
     #[tokio::test]
     async fn search_ignores_chunks_whose_note_was_deleted() {
         let memory = test_memory().await;
-        let orphan_parent = Thing::from((DOCUMENT_TABLE, "gone"));
+        let orphan_parent = RecordId::new(DOCUMENT_TABLE, "gone");
         insert_chunk(&memory, &orphan_parent, "orphan", Some(vec![1.0, 0.0])).await;
 
         let results = memory.search_by_embedding(vec![1.0, 0.0], 8).await.unwrap();
@@ -1137,7 +1228,10 @@ mod memory_tests {
         memory.delete_document("Remove.md").await.unwrap();
         memory.delete_document("Never existed.md").await.unwrap();
 
-        assert_eq!(memory.document_titles().await.unwrap(), vec!["Keep.md".to_string()]);
+        assert_eq!(
+            memory.document_titles().await.unwrap(),
+            vec!["Keep.md".to_string()]
+        );
         let stats = memory.index_stats().await.unwrap();
         assert_eq!((stats.documents, stats.passages), (1, 1));
     }
@@ -1158,7 +1252,13 @@ mod memory_tests {
     }
 
     async fn chunks_of(memory: &Memory, title: &str) -> Vec<TextChunk> {
-        let id = memory.find_document_by_title(title).await.unwrap().unwrap().id.unwrap();
+        let id = memory
+            .find_document_by_title(title)
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+            .unwrap();
         let mut response = memory
             .db
             .query("SELECT * FROM chunk WHERE parent = $id ORDER BY sequence ASC")
@@ -1171,13 +1271,24 @@ mod memory_tests {
     #[tokio::test]
     async fn indexing_stores_sections_and_follows_moved_passages() {
         let memory = test_memory().await;
-        let note = "---\nstatus: \"Done\"\n---\n\n# Part 1\n\nOpening.\n\n## Scene 2\n\nShe runs.\n";
-        memory.to_document_context(NoteDocument::from_parts("Novel.md", note)).await.unwrap();
+        let note =
+            "---\nstatus: \"Done\"\n---\n\n# Part 1\n\nOpening.\n\n## Scene 2\n\nShe runs.\n";
+        memory
+            .to_document_context(NoteDocument::from_parts("Novel.md", note))
+            .await
+            .unwrap();
 
         let chunks = chunks_of(&memory, "Novel.md").await;
         let got: Vec<(&str, &str, usize, usize)> = chunks
             .iter()
-            .map(|c| (c.content.as_str(), c.section.as_str(), c.start_line, c.end_line))
+            .map(|c| {
+                (
+                    c.content.as_str(),
+                    c.section.as_str(),
+                    c.start_line,
+                    c.end_line,
+                )
+            })
             .collect();
         assert_eq!(
             got,
@@ -1190,22 +1301,34 @@ mod memory_tests {
         // A line added above moves both passages; they keep their records.
         let ids: Vec<_> = chunks.iter().map(|c| c.get_thing_id()).collect();
         let edited = note.replace("# Part 1", "Preface.\n\n# Part 1");
-        memory.to_document_context(NoteDocument::from_parts("Novel.md", &edited)).await.unwrap();
+        memory
+            .to_document_context(NoteDocument::from_parts("Novel.md", &edited))
+            .await
+            .unwrap();
 
         let chunks = chunks_of(&memory, "Novel.md").await;
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].content, "Preface.");
         assert_eq!((chunks[1].start_line, chunks[2].start_line), (7, 11));
-        assert_eq!(vec![chunks[1].get_thing_id(), chunks[2].get_thing_id()], ids);
+        assert_eq!(
+            vec![chunks[1].get_thing_id(), chunks[2].get_thing_id()],
+            ids
+        );
 
         // Removing a passage deletes its chunk; the ones below move back up in the
         // same write, keeping their records.
-        memory.to_document_context(NoteDocument::from_parts("Novel.md", note)).await.unwrap();
+        memory
+            .to_document_context(NoteDocument::from_parts("Novel.md", note))
+            .await
+            .unwrap();
 
         let chunks = chunks_of(&memory, "Novel.md").await;
         let got: Vec<(usize, usize)> = chunks.iter().map(|c| (c.sequence, c.start_line)).collect();
         assert_eq!(got, vec![(0, 5), (1, 9)]);
-        assert_eq!(chunks.iter().map(|c| c.get_thing_id()).collect::<Vec<_>>(), ids);
+        assert_eq!(
+            chunks.iter().map(|c| c.get_thing_id()).collect::<Vec<_>>(),
+            ids
+        );
     }
 
     #[tokio::test]
@@ -1222,14 +1345,20 @@ mod memory_tests {
         // Idempotent: runs on every launch.
         memory.ensure_indexes(Some(3)).await.unwrap();
 
-        let results = memory.search_by_embedding(vec![1.0, 0.0, 0.0], 8).await.unwrap();
+        let results = memory
+            .search_by_embedding(vec![1.0, 0.0, 0.0], 8)
+            .await
+            .unwrap();
         let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
         assert_eq!(contents, vec!["near", "close"]);
         assert!((results[0].score - 1.0).abs() < 1e-4);
 
         // New chunks of the right size go into the index.
         insert_chunk(&memory, &doc, "newest", Some(vec![0.99, 0.1, 0.0])).await;
-        let results = memory.search_by_embedding(vec![1.0, 0.0, 0.0], 8).await.unwrap();
+        let results = memory
+            .search_by_embedding(vec![1.0, 0.0, 0.0], 8)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -1238,17 +1367,46 @@ mod memory_tests {
         let memory = test_memory().await;
         memory.ensure_indexes(Some(3)).await.unwrap();
         let doc = insert_document(&memory, "World.md").await;
-        insert_chunk(&memory, &doc, "The dragon sleeps under the mountain", Some(vec![1.0, 0.0, 0.0])).await;
-        insert_chunk(&memory, &doc, "Zephyrine draws the maps", Some(vec![0.0, 1.0, 0.0])).await;
-        insert_chunk(&memory, &doc, "Soup with carrots", Some(vec![0.0, 0.0, 1.0])).await;
+        insert_chunk(
+            &memory,
+            &doc,
+            "The dragon sleeps under the mountain",
+            Some(vec![1.0, 0.0, 0.0]),
+        )
+        .await;
+        insert_chunk(
+            &memory,
+            &doc,
+            "Zephyrine draws the maps",
+            Some(vec![0.0, 1.0, 0.0]),
+        )
+        .await;
+        insert_chunk(
+            &memory,
+            &doc,
+            "Soup with carrots",
+            Some(vec![0.0, 0.0, 1.0]),
+        )
+        .await;
 
         let results = memory
-            .search_hybrid("Where does Zephyrine keep the dragon?", vec![1.0, 0.0, 0.0], 8, None)
+            .search_hybrid(
+                "Where does Zephyrine keep the dragon?",
+                vec![1.0, 0.0, 0.0],
+                8,
+                None,
+            )
             .await
             .unwrap();
         let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
         // Found by both searches, so first; then the name the embedding missed.
-        assert_eq!(contents, vec!["The dragon sleeps under the mountain", "Zephyrine draws the maps"]);
+        assert_eq!(
+            contents,
+            vec![
+                "The dragon sleeps under the mountain",
+                "Zephyrine draws the maps"
+            ]
+        );
         assert_eq!(results[0].found_by, FOUND_BY_MEANING | FOUND_BY_KEYWORDS);
         assert_eq!(results[1].found_by, FOUND_BY_KEYWORDS);
         // Scores stay cosine similarities, whichever search found the passage.
@@ -1262,7 +1420,10 @@ mod memory_tests {
         insert_chunk(&memory, &doc, "match", Some(vec![1.0, 0.0])).await;
         insert_chunk(&memory, &doc, "keyword only", Some(vec![0.0, 1.0])).await;
 
-        let results = memory.search_hybrid("keyword", vec![1.0, 0.0], 8, None).await.unwrap();
+        let results = memory
+            .search_hybrid("keyword", vec![1.0, 0.0], 8, None)
+            .await
+            .unwrap();
         let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
         assert_eq!(contents, vec!["match"]);
     }
@@ -1276,10 +1437,28 @@ mod memory_tests {
         let loose = insert_document(&memory, "Novelettes.md").await;
         // Lore holds the passages nearest the query; the index would return only those.
         for i in 0..30 {
-            insert_chunk(&memory, &lore, &format!("dragon lore {i}"), Some(vec![1.0, i as f32 * 0.001])).await;
+            insert_chunk(
+                &memory,
+                &lore,
+                &format!("dragon lore {i}"),
+                Some(vec![1.0, i as f32 * 0.001]),
+            )
+            .await;
         }
-        insert_chunk(&memory, &novel, "the dragon attacks the keep", Some(vec![1.0, 0.3])).await;
-        insert_chunk(&memory, &loose, "dragon in a loose note", Some(vec![1.0, 0.0])).await;
+        insert_chunk(
+            &memory,
+            &novel,
+            "the dragon attacks the keep",
+            Some(vec![1.0, 0.3]),
+        )
+        .await;
+        insert_chunk(
+            &memory,
+            &loose,
+            "dragon in a loose note",
+            Some(vec![1.0, 0.0]),
+        )
+        .await;
 
         let results = memory
             .search_hybrid("dragon keep", vec![1.0, 0.0], 8, Some("Novel"))
@@ -1289,10 +1468,16 @@ mod memory_tests {
         assert_eq!(contents, vec!["the dragon attacks the keep"]);
         assert_eq!(results[0].title, "Novel/Part 1/Ch 3.md");
 
-        let everywhere = memory.search_hybrid("dragon keep", vec![1.0, 0.0], 8, None).await.unwrap();
+        let everywhere = memory
+            .search_hybrid("dragon keep", vec![1.0, 0.0], 8, None)
+            .await
+            .unwrap();
         assert!(everywhere.iter().any(|r| r.title == "Lore/Dragons.md"));
 
-        let empty = memory.search_hybrid("dragon", vec![1.0, 0.0], 8, Some("Missing")).await.unwrap();
+        let empty = memory
+            .search_hybrid("dragon", vec![1.0, 0.0], 8, Some("Missing"))
+            .await
+            .unwrap();
         assert!(empty.is_empty());
     }
 
@@ -1346,7 +1531,9 @@ mod memory_tests {
         model.embed("where did she walk?").await.unwrap();
         println!("1 query in {:?}", started.elapsed());
 
-        let batch: Vec<String> = (0..32).map(|i| format!("Novel › Part {i}\n{passage}")).collect();
+        let batch: Vec<String> = (0..32)
+            .map(|i| format!("Novel › Part {i}\n{passage}"))
+            .collect();
         let started = std::time::Instant::now();
         for text in &batch {
             model.embed(text).await.unwrap();
@@ -1356,9 +1543,10 @@ mod memory_tests {
 
     #[test]
     fn pretty_title_strips_extension_and_joins_folders() {
-        assert_eq!(pretty_title("Novel/Part 1/Chapter 3.md"), "Novel › Part 1 › Chapter 3");
+        assert_eq!(
+            pretty_title("Novel/Part 1/Chapter 3.md"),
+            "Novel › Part 1 › Chapter 3"
+        );
         assert_eq!(pretty_title("Ideas.md"), "Ideas");
     }
 }
-
-

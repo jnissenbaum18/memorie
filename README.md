@@ -26,41 +26,32 @@ writing without sending a word to the cloud.
 
 ## Install
 
-Grab the latest macOS build from [Releases](https://github.com/Riley1101/memorie/releases).
+1. Download the latest macOS build from [Releases](https://github.com/Riley1101/memorie/releases).
+2. Open the download and drag **Memoire** into your Applications folder.
+3. Launch it and start writing.
 
-## Development
+## Updates
 
-```sh
-bun install
-bun run tauri dev      # run the desktop app
-bun run tauri build    # produce a release bundle
-```
+Memoire checks for new versions in the background and downloads them quietly.
+Nothing is installed until you restart, and you'll be offered a restart when an update is ready.
+You can also check by hand in **Settings → Updates**.
 
-Dropbox sync needs an app key, which is baked in at build time:
+Every update is signed, and Memoire refuses any update it can't verify.
 
-```sh
-DROPBOX_APP_KEY=your_app_key bun run tauri build
-```
+## Your data
 
-Create the app at [dropbox.com/developers/apps](https://www.dropbox.com/developers/apps)
-with the `files.content.read`, `files.content.write` and `account_info.read` scopes, and
-register `http://localhost:53682/` as a redirect URI. Login uses PKCE, so there is no
-client secret to keep; the refresh token is stored in the OS keyring.
+Your writing is plain Markdown on your own disk. Nothing leaves your machine unless you
+turn on Git or Dropbox sync, or choose a hosted model.
 
-## Sample config
+## Feedback
 
-```yaml
-content_directory: '~/.memorie/notes'
-dropbox_folder: '/Memoire'
-undotree_dir: '~/.memorie/.history'
-default_llm_model: 'qwen_2_5_0_5b_instruct'
-```
+Found a bug or have an idea? Open an issue at
+[github.com/Riley1101/memorie/issues](https://github.com/Riley1101/memorie/issues).
 
-## Status
-
-Version 0.1.0 — first release. Expect rough edges.
+Want to build Memoire from source or contribute? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Roadmap
 
 A mobile companion and margin notes & review are planned.
+
 A plugin API is being explored.

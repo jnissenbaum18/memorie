@@ -25,7 +25,11 @@ impl File {
 
     /// `folder`, if given, is treated as the single top-level directory the file
     /// lives in. Kept for callers that only ever deal with one level of nesting.
-    pub fn with_folder(path: PathBuf, modified: Option<SystemTime>, folder: Option<String>) -> Self {
+    pub fn with_folder(
+        path: PathBuf,
+        modified: Option<SystemTime>,
+        folder: Option<String>,
+    ) -> Self {
         Self::with_relative_dir(path, modified, folder.into_iter().collect())
     }
 
@@ -57,7 +61,12 @@ impl File {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        File { path, name, last_modified, folder }
+        File {
+            path,
+            name,
+            last_modified,
+            folder,
+        }
     }
 
     pub fn read_content(&self) -> Result<String, FileError> {
@@ -73,6 +82,40 @@ impl File {
     pub fn extension(&self) -> Option<&str> {
         self.path.extension().and_then(OsStr::to_str)
     }
+}
+
+/// Resolves a content-relative name (e.g. `"Novel/Chapter 1/Scene.md"`) against
+/// the content directory, refusing anything that would land outside it.
+///
+/// Names reach this from the frontend, from imports and from model output, so
+/// absolute paths, Windows drive prefixes and `..` segments are all rejected
+/// rather than normalised away. The check is lexical: the target does not have
+/// to exist yet.
+pub fn resolve_in(directory: &Path, relative: &str) -> Result<PathBuf, FileError> {
+    use std::path::Component;
+
+    let trimmed = relative.trim();
+    if trimmed.is_empty() {
+        return Err(FileError::InvalidPath(relative.to_string()));
+    }
+
+    let mut resolved = directory.to_path_buf();
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            // "./" is harmless noise; everything else escapes or re-roots.
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(FileError::InvalidPath(relative.to_string()));
+            }
+        }
+    }
+
+    if resolved == directory || !resolved.starts_with(directory) {
+        return Err(FileError::InvalidPath(relative.to_string()));
+    }
+
+    Ok(resolved)
 }
 
 /// Recursively scans `directory` for `.md` files at any depth. Top-level
@@ -122,7 +165,9 @@ pub fn get_recent(directory: &Path) -> Result<Vec<File>, FileError> {
     // Codex entries are files too, but they aren't writings; the codex lists them.
     let files = files_with_mod_time
         .into_iter()
-        .map(|(path, mod_time, relative_dir)| File::with_relative_dir(path, Some(mod_time), relative_dir))
+        .map(|(path, mod_time, relative_dir)| {
+            File::with_relative_dir(path, Some(mod_time), relative_dir)
+        })
         .filter(|file| !crate::codex::is_codex_name(&file.name))
         .collect();
 
@@ -153,7 +198,9 @@ pub fn discover_files(directory: &Path) -> Result<Vec<File>, FileError> {
 
     let mut files: Vec<File> = found
         .into_iter()
-        .map(|(path, modified, relative_dir)| File::with_relative_dir(path, Some(modified), relative_dir))
+        .map(|(path, modified, relative_dir)| {
+            File::with_relative_dir(path, Some(modified), relative_dir)
+        })
         .collect();
 
     files.sort_by(|a, b| a.name.cmp(&b.name));
@@ -162,19 +209,27 @@ pub fn discover_files(directory: &Path) -> Result<Vec<File>, FileError> {
 
 /// `relative_dir` is the full chain of directory names (binder, then any nested
 /// chapter/scene folders) the file lives in, e.g. `["Novel", "Chapter 1"]`.
-pub fn create_file(path: &Path, content: &str, relative_dir: Vec<String>) -> Result<File, FileError> {
+pub fn create_file(
+    path: &Path,
+    content: &str,
+    relative_dir: Vec<String>,
+) -> Result<File, FileError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, content)?;
     let modified = fs::metadata(path)?.modified().ok();
-    Ok(File::with_relative_dir(path.to_path_buf(), modified, relative_dir))
+    Ok(File::with_relative_dir(
+        path.to_path_buf(),
+        modified,
+        relative_dir,
+    ))
 }
 
 /// Creates an empty folder (binder subdirectory, chapter, scene grouping, ...)
 /// at `relative_path` under `directory`, creating any missing parents.
 pub fn create_folder(directory: &Path, relative_path: &str) -> Result<(), FileError> {
-    fs::create_dir_all(directory.join(relative_path))?;
+    fs::create_dir_all(resolve_in(directory, relative_path)?)?;
     Ok(())
 }
 
@@ -241,19 +296,22 @@ pub fn list_binders(directory: &Path) -> Result<Vec<String>, FileError> {
 }
 
 pub fn create_binder(directory: &Path, name: &str) -> Result<(), FileError> {
-    fs::create_dir_all(directory.join(name))?;
+    fs::create_dir_all(resolve_in(directory, name)?)?;
     Ok(())
 }
 
 pub fn rename_binder(directory: &Path, old_name: &str, new_name: &str) -> Result<(), FileError> {
-    fs::rename(directory.join(old_name), directory.join(new_name))?;
+    fs::rename(
+        resolve_in(directory, old_name)?,
+        resolve_in(directory, new_name)?,
+    )?;
     Ok(())
 }
 
 /// Deletes binder `name` inside `directory`. Refuses if the binder contains
 /// any writings (files), so a binder can only be deleted while empty.
 pub fn delete_binder(directory: &Path, name: &str) -> Result<(), FileError> {
-    let path = directory.join(name);
+    let path = resolve_in(directory, name)?;
 
     if fs::read_dir(&path)?.next().is_some() {
         return Err(FileError::BinderNotEmpty(name.to_string()));
@@ -267,7 +325,7 @@ pub fn delete_binder(directory: &Path, name: &str) -> Result<(), FileError> {
 /// binder) inside `directory`. Refuses if it contains anything, same rule as
 /// `delete_binder`.
 pub fn delete_folder(directory: &Path, relative_path: &str) -> Result<(), FileError> {
-    let path = directory.join(relative_path);
+    let path = resolve_in(directory, relative_path)?;
 
     if fs::read_dir(&path)?.next().is_some() {
         return Err(FileError::BinderNotEmpty(relative_path.to_string()));
@@ -282,6 +340,9 @@ pub fn update_file(file: &File, content: &str) -> Result<File, FileError> {
     Ok(file.clone())
 }
 
+/// Removes a writing from disk for good. Deleting from the app goes through
+/// `trash::send_to_trash` instead; this is the final step behind it.
+#[allow(dead_code)]
 pub fn delete_file(file: &File) -> Result<(), FileError> {
     fs::remove_file(&file.path)?;
     Ok(())
@@ -290,8 +351,8 @@ pub fn delete_file(file: &File) -> Result<(), FileError> {
 /// Moves a writing to any content-relative path, creating parent folders as
 /// needed. Refuses to overwrite an existing file.
 pub fn move_file(directory: &Path, old_name: &str, new_name: &str) -> Result<File, FileError> {
-    let old_path = directory.join(old_name);
-    let new_path = directory.join(new_name);
+    let old_path = resolve_in(directory, old_name)?;
+    let new_path = resolve_in(directory, new_name)?;
     // A case-only change ("scene.md" -> "Scene.md") resolves to the same file on
     // case-insensitive filesystems (macOS, Windows), so it is not a clash.
     let case_only = old_name != new_name && old_name.to_lowercase() == new_name.to_lowercase();
@@ -320,13 +381,21 @@ mod fs_tests {
     #[test]
     fn codex_entries_are_not_writings_binders_or_tree_folders() {
         let dir = tempdir().unwrap();
-        for name in ["Novel/Scene.md", "Novel/Codex/Characters/Aria.md", "Codex/Items/Sword.md"] {
+        for name in [
+            "Novel/Scene.md",
+            "Novel/Codex/Characters/Aria.md",
+            "Codex/Items/Sword.md",
+        ] {
             let path = dir.path().join(name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, "text").unwrap();
         }
 
-        let recent: Vec<_> = get_recent(dir.path()).unwrap().into_iter().map(|f| f.name).collect();
+        let recent: Vec<_> = get_recent(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
         assert_eq!(recent, vec!["Novel/Scene.md".to_string()]);
         assert_eq!(list_binders(dir.path()).unwrap(), vec!["Novel".to_string()]);
         assert_eq!(list_folders(dir.path()).unwrap(), vec!["Novel".to_string()]);
@@ -344,7 +413,10 @@ mod fs_tests {
         rename_file(dir.path(), "Novel/Ch 1/Scene.md", "Novel/Ch 1/Opening.md").unwrap();
 
         assert!(!chapter.join("Scene.md").exists());
-        assert_eq!(fs::read_to_string(chapter.join("Opening.md")).unwrap(), "text");
+        assert_eq!(
+            fs::read_to_string(chapter.join("Opening.md")).unwrap(),
+            "text"
+        );
     }
 
     #[test]
@@ -453,7 +525,10 @@ mod fs_tests {
         let discovered = discover_files(dir.path()).unwrap();
 
         assert_eq!(discovered.len(), 2);
-        let nested = discovered.iter().find(|f| f.name == "Binder/nested.md").unwrap();
+        let nested = discovered
+            .iter()
+            .find(|f| f.name == "Binder/nested.md")
+            .unwrap();
         assert_eq!(nested.folder.as_deref(), Some("Binder"));
         let top = discovered.iter().find(|f| f.name == "top.md").unwrap();
         assert_eq!(top.folder, None);
@@ -464,7 +539,10 @@ mod fs_tests {
         let dir = tempdir().unwrap();
 
         create_file(
-            &dir.path().join("Novel").join("Chapter 1").join("Scene 1.md"),
+            &dir.path()
+                .join("Novel")
+                .join("Chapter 1")
+                .join("Scene 1.md"),
             "scene one",
             vec!["Novel".to_string(), "Chapter 1".to_string()],
         )
@@ -562,7 +640,10 @@ mod fs_tests {
     fn test_delete_folder_with_scenes_fails() {
         let dir = tempdir().unwrap();
         create_file(
-            &dir.path().join("Novel").join("Chapter 1").join("Scene 1.md"),
+            &dir.path()
+                .join("Novel")
+                .join("Chapter 1")
+                .join("Scene 1.md"),
             "content",
             vec!["Novel".to_string(), "Chapter 1".to_string()],
         )

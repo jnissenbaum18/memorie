@@ -14,12 +14,13 @@ mod indexer;
 mod llm;
 mod memory;
 mod pdf;
-mod reranker;
 mod prompts;
 mod providers;
+mod reranker;
 mod responses;
 mod rtf;
 mod search;
+mod trash;
 mod undotree;
 mod utils;
 mod workers;
@@ -42,155 +43,296 @@ pub struct AppState {
     workers: LlmEventService,
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub async fn run() {
-    let home_dir = utils::get_app_dir()
-        .expect("Failed to get home directory")
-        .join("config.yaml");
+/// How long the exit path waits for the editor to write out unsaved text.
+/// Long enough for a large document, short enough that a wedged webview can
+/// never hold the window open.
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let config_path_str = home_dir.to_str().expect("Config path is not valid UTF-8");
+/// Asks the frontend to write out anything still sitting in the autosave
+/// debounce, and waits for it to confirm. Without this, quitting inside the
+/// debounce window loses the last few seconds of typing — and the auto-push
+/// below would then commit the stale file.
+async fn flush_unsaved(app_handle: &tauri::AppHandle) {
+    use tauri::{Emitter, Listener};
 
-    if let Err(e) = config::AppConfig::init_default_config(config_path_str) {
-        eprintln!("Failed to initialize config: {}", e);
-        panic!("Failed to initialize config: {}", e);
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let handler = app_handle.once("memoire://flushed", move |_| {
+        if let Ok(mut slot) = tx.lock() {
+            if let Some(tx) = slot.take() {
+                let _ = tx.send(());
+            }
+        }
+    });
+
+    if app_handle.emit("memoire://flush-before-exit", ()).is_err() {
+        app_handle.unlisten(handler);
+        return;
     }
 
-    let app_config = config::AppConfig::load(config_path_str)
-        .expect("Failed to load config after initialization");
+    if tokio::time::timeout(FLUSH_TIMEOUT, rx).await.is_err() {
+        eprintln!("Editor did not confirm its last save before exit; continuing.");
+        app_handle.unlisten(handler);
+    }
+}
 
-    let memory_instance = Memory::new()
+/// Pushes writing to the preferred remote when auto-push on exit is turned on.
+/// Runs when the main window closes, and before an update is installed.
+async fn run_exit_tasks(app_handle: &tauri::AppHandle) {
+    flush_unsaved(app_handle).await;
+
+    let state = app_handle.state::<AppState>();
+    // Only the preferred storage pushes on exit, so closing
+    // the app never fans the same writing out to two remotes.
+    let (should_push, content_dir, dropbox_folder) = {
+        let config = state.config.lock().await;
+        let provider = config.sync_provider.clone();
+        (
+            provider == SyncProvider::Github
+                && config.auto_push_on_exit
+                && config.github_repo.is_some(),
+            config.content_directory.clone(),
+            (provider == SyncProvider::Dropbox && config.dropbox_auto_push_on_exit)
+                .then(|| config.dropbox_folder.clone())
+                .flatten(),
+        )
+    };
+
+    if should_push {
+        if let Ok(Some(token)) = git::load_token() {
+            if let Ok(user) = git::fetch_github_user(&token).await {
+                let author_name = user.name.unwrap_or_else(|| user.login.clone());
+                let author_email = format!("{}@users.noreply.github.com", user.login);
+                let message = format!(
+                    "Auto-sync on exit — {}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                );
+                let _ = git::commit_and_push(
+                    &content_dir,
+                    &message,
+                    &token,
+                    &author_name,
+                    &author_email,
+                );
+            }
+        }
+    }
+
+    if let Some(folder) = dropbox_folder {
+        if let Err(e) = dropbox::push(&content_dir, &folder).await {
+            eprintln!("Dropbox auto-push on exit failed: {e}");
+        }
+    }
+}
+
+/// Runs the on-exit sync ahead of installing an update. The frontend calls this
+/// before `install()` because on Windows the installer quits the app at once,
+/// skipping the window-close handler.
+#[tauri::command]
+async fn prepare_for_update(app_handle: tauri::AppHandle) {
+    run_exit_tasks(&app_handle).await;
+}
+
+/// Relaunches the app so a freshly installed update takes effect.
+#[tauri::command]
+fn restart_app(app_handle: tauri::AppHandle) {
+    app_handle.restart();
+}
+
+/// Everything `setup` needs that can fail before there is a window to report
+/// the failure in.
+struct Startup {
+    config: AppConfig,
+    undo_tree: UndoTree,
+    model: Model,
+    memory: Memory,
+    manifest: std::path::PathBuf,
+}
+
+/// Loads the config, version history and note database. Returns a message fit
+/// to show the user rather than panicking: a corrupt config or database used
+/// to kill the process with no window and no explanation.
+async fn load_startup() -> Result<Startup, String> {
+    let config_path = utils::get_app_dir()
+        .map_err(|e| format!("Could not find your application data folder: {e}"))?
+        .join("config.yaml");
+
+    let config_path_str = config_path.to_str().ok_or_else(|| {
+        format!(
+            "The config path {} is not valid UTF-8.",
+            config_path.display()
+        )
+    })?;
+
+    config::AppConfig::init_default_config(config_path_str)
+        .map_err(|e| format!("Could not create {}: {e}", config_path.display()))?;
+
+    let config = config::AppConfig::load(config_path_str)
+        .map_err(|e| format!("Could not read {}: {e}", config_path.display()))?;
+
+    let memory = Memory::new()
         .await
-        .expect("Failed to initialize memory database");
+        .map_err(|e| format!("Could not open the note database: {e}"))?;
 
-    #[cfg(debug_assertions)]
-    let devtools = tauri_plugin_devtools::init();
-
-    let watch_dir = app_config.content_directory.clone();
-
-    let undo_tree = UndoTree::load(&app_config.undotree_dir).unwrap_or_else(|e| {
+    // History is the one piece we can do without: carry on, saying so.
+    let undo_tree = UndoTree::load(&config.undotree_dir).unwrap_or_else(|e| {
         eprintln!(
             "Could not open version history at {}: {e}. History will not be kept this session.",
-            app_config.undotree_dir.display()
+            config.undotree_dir.display()
         );
         UndoTree::new()
     });
 
-    let default_model_path = app_config.default_llm_model.clone();
+    let manifest = utils::get_app_dir()
+        .map_err(|e| format!("Could not find your application data folder: {e}"))?
+        .join("db/index-manifest.json");
 
-    let model = Model::new(default_model_path);
+    let model = Model::new(config.default_llm_model.clone());
 
-    let mut builder = tauri::Builder::default().setup(|app| {
-        let app_handle = app.handle().clone();
-        let app_state = AppState {
-            config: Mutex::new(app_config),
-            undotree: Mutex::new(undo_tree),
-            model: Mutex::new(model),
-            memory: memory_instance,
-            indexer: indexer::Indexer::new(
-                utils::get_app_dir()
-                    .expect("Failed to get app directory")
-                    .join("db/index-manifest.json"),
-            ),
-            workers: LlmEventService::new(app_handle),
-        };
-        app.manage(app_state);
+    Ok(Startup {
+        config,
+        undo_tree,
+        model,
+        memory,
+        manifest,
+    })
+}
 
-        // Load (and on first run download) the embedding model and reranker in the
-        // background, so neither delays the window nor the first notes search.
-        // Nothing else holds the config lock yet during setup.
-        let ai_enabled = app
-            .state::<AppState>()
-            .config
-            .try_lock()
-            .map(|config| config.ai_enabled)
-            .unwrap_or(false);
-        if ai_enabled {
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let memory = &handle.state::<AppState>().memory;
-                if let Err(e) = memory.embedder().await {
-                    eprintln!("Could not load the embedding model: {e}");
-                }
-                memory.reranker().await;
-            });
-        }
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub async fn run() {
+    let startup = load_startup().await;
 
-        // Keeps the note index current when notes change on disk. The frontend
-        // asks for a first pass on startup.
-        let watch_dir = watch_dir; // moved in: setup outlives `run`'s locals
-        if let Err(e) = app.state::<AppState>().indexer.watch(app.handle(), &watch_dir) {
-            eprintln!("Could not watch {} for changes: {e}", watch_dir.display());
-        }
+    #[cfg(debug_assertions)]
+    let devtools = tauri_plugin_devtools::init();
 
-        if let Some(window) = app.get_webview_window("main") {
-            let app_handle = app.handle().clone();
-            let closing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let window_for_close = window.clone();
+    let watch_dir = startup
+        .as_ref()
+        .ok()
+        .map(|s| s.config.content_directory.clone());
 
-            window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    if closing.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        // Already ran the auto-push check; let this close through.
-                        return;
-                    }
-                    api.prevent_close();
+    let mut startup = Some(startup);
 
-                    let app_handle = app_handle.clone();
-                    let window = window_for_close.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state = app_handle.state::<AppState>();
-                        // Only the preferred storage pushes on exit, so closing
-                        // the app never fans the same writing out to two remotes.
-                        let (should_push, content_dir, dropbox_folder) = {
-                            let config = state.config.lock().await;
-                            let provider = config.sync_provider.clone();
-                            (
-                                provider == SyncProvider::Github
-                                    && config.auto_push_on_exit
-                                    && config.github_repo.is_some(),
-                                config.content_directory.clone(),
-                                (provider == SyncProvider::Dropbox
-                                    && config.dropbox_auto_push_on_exit)
-                                    .then(|| config.dropbox_folder.clone())
-                                    .flatten(),
-                            )
-                        };
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(move |app| {
+            let startup = match startup.take().expect("setup runs once") {
+                Ok(startup) => startup,
+                Err(message) => {
+                    // The dialog plugin is up by now, so the writer gets a
+                    // reason instead of an icon that bounces and vanishes.
+                    eprintln!("Startup failed: {message}");
 
-                        if should_push {
-                            if let Ok(Some(token)) = git::load_token() {
-                                if let Ok(user) = git::fetch_github_user(&token).await {
-                                    let author_name = user.name.unwrap_or_else(|| user.login.clone());
-                                    let author_email =
-                                        format!("{}@users.noreply.github.com", user.login);
-                                    let message = format!(
-                                        "Auto-sync on exit — {}",
-                                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-                                    );
-                                    let _ = git::commit_and_push(
-                                        &content_dir,
-                                        &message,
-                                        &token,
-                                        &author_name,
-                                        &author_email,
-                                    );
-                                }
-                            }
-                        }
-
-                        if let Some(folder) = dropbox_folder {
-                            if let Err(e) = dropbox::push(&content_dir, &folder).await {
-                                eprintln!("Dropbox auto-push on exit failed: {e}");
-                            }
-                        }
-
+                    // No state was managed, so the window has nothing to talk
+                    // to; close it rather than show an empty frame.
+                    if let Some(window) = app.get_webview_window("main") {
                         let _ = window.close();
-                    });
-                }
-            });
-        }
+                    }
 
-        Ok(())
-    });
+                    // `blocking_show` freezes whatever thread it is on, and
+                    // setup runs on the main one, so the dialog gets its own.
+                    let handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                        use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                        handle
+                            .dialog()
+                            .message(format!("{message}\n\nMemoire cannot start."))
+                            .kind(MessageDialogKind::Error)
+                            .title("Memoire could not start")
+                            .blocking_show();
+                        std::process::exit(1);
+                    });
+                    return Ok(());
+                }
+            };
+
+            let app_handle = app.handle().clone();
+            let app_state = AppState {
+                config: Mutex::new(startup.config),
+                undotree: Mutex::new(startup.undo_tree),
+                model: Mutex::new(startup.model),
+                memory: startup.memory,
+                indexer: indexer::Indexer::new(startup.manifest),
+                workers: LlmEventService::new(app_handle),
+            };
+            app.manage(app_state);
+
+            // Load (and on first run download) the embedding model and reranker in the
+            // background, so neither delays the window nor the first notes search.
+            // Nothing else holds the config lock yet during setup.
+            let ai_enabled = app
+                .state::<AppState>()
+                .config
+                .try_lock()
+                .map(|config| config.ai_enabled)
+                .unwrap_or(false);
+            if ai_enabled {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let memory = &handle.state::<AppState>().memory;
+                    if let Err(e) = memory.embedder().await {
+                        eprintln!("Could not load the embedding model: {e}");
+                    }
+                    memory.reranker().await;
+                });
+            }
+
+            // Keeps the note index current when notes change on disk. The frontend
+            // asks for a first pass on startup.
+            if let Some(dir) = watch_dir.clone() {
+                match trash::purge_expired(&dir) {
+                    Ok(n) if n > 0 => {
+                        println!(
+                            "Removed {n} item(s) from the trash after {} days.",
+                            trash::RETENTION_DAYS
+                        )
+                    }
+                    Err(e) => eprintln!("Could not tidy the trash: {e}"),
+                    _ => {}
+                }
+            }
+
+            if let Some(watch_dir) = watch_dir.clone() {
+                if let Err(e) = app
+                    .state::<AppState>()
+                    .indexer
+                    .watch(app.handle(), &watch_dir)
+                {
+                    eprintln!("Could not watch {} for changes: {e}", watch_dir.display());
+                }
+            }
+
+            if let Some(window) = app.get_webview_window("main") {
+                let app_handle = app.handle().clone();
+                let closing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let window_for_close = window.clone();
+
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        if closing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            // Already ran the auto-push check; let this close through.
+                            return;
+                        }
+                        api.prevent_close();
+
+                        let app_handle = app_handle.clone();
+                        let window = window_for_close.clone();
+                        tauri::async_runtime::spawn(async move {
+                            // The push can take seconds on a slow network; let
+                            // the window say so instead of just sitting there.
+                            use tauri::Emitter;
+                            let _ = app_handle.emit("memoire://closing", ());
+
+                            run_exit_tasks(&app_handle).await;
+
+                            let _ = window.close();
+                        });
+                    }
+                });
+            }
+
+            Ok(())
+        });
 
     #[cfg(debug_assertions)]
     {
@@ -200,7 +342,6 @@ pub async fn run() {
     builder
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::list_recents,
             commands::create_file,
@@ -215,6 +356,11 @@ pub async fn run() {
             commands::create_folder,
             commands::list_folders,
             commands::delete_folder,
+            commands::delete_folder_to_trash,
+            commands::list_trash,
+            commands::restore_from_trash,
+            commands::purge_from_trash,
+            commands::empty_trash,
             commands::check_models,
             commands::get_supported_models,
             commands::download_model,
@@ -274,6 +420,8 @@ pub async fn run() {
             commands::codex_detect,
             commands::codex_matrix,
             commands::codex_draft,
+            prepare_for_update,
+            restart_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
